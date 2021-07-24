@@ -40,6 +40,11 @@ typedef struct DecimateContext {
 
     float frac;                    ///< threshold of changed pixels over the total fraction
 
+    int  x;                        ///< x offset of the selected area
+    int  y;                        ///< y offset of the selected area
+    int  w;                        ///< width of the selected area
+    int  h;                        ///< height of the selected area
+
     int max_drop_count;            ///< if positive: maximum number of sequential frames to drop
                                    ///< if negative: minimum number of frames between two drops
 
@@ -54,16 +59,20 @@ typedef struct DecimateContext {
 #define OFFSET(x) offsetof(DecimateContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
 
-static const AVOption mpdecimate_options[] = {
+static const AVOption mpdecimate_area_options[] = {
     { "max",  "set the maximum number of consecutive dropped frames (positive), or the minimum interval between dropped frames (negative)",
       OFFSET(max_drop_count), AV_OPT_TYPE_INT, {.i64=0}, INT_MIN, INT_MAX, FLAGS },
     { "hi",   "set high dropping threshold", OFFSET(hi), AV_OPT_TYPE_INT, {.i64=64*12}, INT_MIN, INT_MAX, FLAGS },
     { "lo",   "set low dropping threshold", OFFSET(lo), AV_OPT_TYPE_INT, {.i64=64*5}, INT_MIN, INT_MAX, FLAGS },
     { "frac", "set fraction dropping threshold",  OFFSET(frac), AV_OPT_TYPE_FLOAT, {.dbl=0.33}, 0, 1, FLAGS },
+    { "x", "set x offset of selected area",  OFFSET(x), AV_OPT_TYPE_INT, {.i64=0}, INT_MIN, INT_MAX, FLAGS },
+    { "y", "set y offset of selected area",  OFFSET(y), AV_OPT_TYPE_INT, {.i64=0}, INT_MIN, INT_MAX, FLAGS },
+    { "w", "set width of selected area",  OFFSET(w), AV_OPT_TYPE_INT, {.i64=0}, INT_MIN, INT_MAX, FLAGS },
+    { "h", "set height of selected area",  OFFSET(h), AV_OPT_TYPE_INT, {.i64=0}, INT_MIN, INT_MAX, FLAGS },
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS(mpdecimate);
+AVFILTER_DEFINE_CLASS(mpdecimate_area);
 
 /**
  * Return 1 if the two planes are different, 0 otherwise.
@@ -71,17 +80,37 @@ AVFILTER_DEFINE_CLASS(mpdecimate);
 static int diff_planes(AVFilterContext *ctx,
                        uint8_t *cur, int cur_linesize,
                        uint8_t *ref, int ref_linesize,
-                       int w, int h)
+                       int w, int h, int hsub, int vsub)
 {
     DecimateContext *decimate = ctx->priv;
 
+    //different planes, different point number, different shift
+    int area_x = AV_CEIL_RSHIFT(decimate->x, hsub);
+    int area_y = AV_CEIL_RSHIFT(decimate->y, vsub);
+    int area_w = AV_CEIL_RSHIFT(decimate->w, hsub);
+    int area_h = AV_CEIL_RSHIFT(decimate->h, vsub);
+
+    w = AV_CEIL_RSHIFT(w, hsub);
+    h = AV_CEIL_RSHIFT(h, vsub);
+
+    const int max_x = w - 7, max_y = h - 7;
+    if (area_x < 0 || area_x >= max_x)    //x illegal
+        area_x = 0;
+    if (area_y < 0 || area_y >= max_y)    //y illegal
+        area_y = 0;
+    if (area_w <= 0 || area_w > max_x - area_x) //w illegal
+        area_w = max_x - area_x;
+    if (area_h <= 0 || area_h > max_y - area_y) //h illegal
+        area_h = max_y - area_y;
+
     int x, y;
     int d, c = 0;
-    int t = (w/16)*(h/16)*decimate->frac;
+    int t = (area_w/16)*(area_h/16)*decimate->frac;
 
     /* compute difference for blocks of 8x8 bytes */
-    for (y = 0; y < h-7; y += 4) {
-        for (x = 8; x < w-7; x += 4) {
+    /* only compare area (x,y,w,h) */
+    for (y = area_y; y < area_y + area_h; y += 4) {
+        for (x = area_x + 8; x < area_x + area_w; x += 4) {
             d = decimate->sad(cur + y*cur_linesize + x, cur_linesize,
                               ref + y*ref_linesize + x, ref_linesize);
             if (d > decimate->hi) {
@@ -130,8 +159,9 @@ static int decimate_frame(AVFilterContext *ctx,
         if (diff_planes(ctx,
                         cur->data[plane], cur->linesize[plane],
                         ref->data[plane], ref->linesize[plane],
-                        AV_CEIL_RSHIFT(ref->width,  hsub),
-                        AV_CEIL_RSHIFT(ref->height, vsub))) {
+                        //AV_CEIL_RSHIFT(ref->width,  hsub),
+                        //AV_CEIL_RSHIFT(ref->height, vsub))) {
+                        ref->width, ref->height, hsub, vsub)) {
             emms_c();
             return 0;
         }
@@ -224,7 +254,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *cur)
     return 0;
 }
 
-static const AVFilterPad mpdecimate_inputs[] = {
+static const AVFilterPad mpdecimate_area_inputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
@@ -234,7 +264,7 @@ static const AVFilterPad mpdecimate_inputs[] = {
     { NULL }
 };
 
-static const AVFilterPad mpdecimate_outputs[] = {
+static const AVFilterPad mpdecimate_area_outputs[] = {
     {
         .name          = "default",
         .type          = AVMEDIA_TYPE_VIDEO,
@@ -242,14 +272,14 @@ static const AVFilterPad mpdecimate_outputs[] = {
     { NULL }
 };
 
-AVFilter ff_vf_mpdecimate = {
-    .name          = "mpdecimate",
-    .description   = NULL_IF_CONFIG_SMALL("Remove near-duplicate frames."),
+AVFilter ff_vf_mpdecimate_area = {
+    .name          = "mpdecimate_area",
+    .description   = NULL_IF_CONFIG_SMALL("Remove near-duplicate frames. Compare specified area only, ignore other areas."),
     .init          = init,
     .uninit        = uninit,
     .priv_size     = sizeof(DecimateContext),
-    .priv_class    = &mpdecimate_class,
+    .priv_class    = &mpdecimate_area_class,
     .query_formats = query_formats,
-    .inputs        = mpdecimate_inputs,
-    .outputs       = mpdecimate_outputs,
+    .inputs        = mpdecimate_area_inputs,
+    .outputs       = mpdecimate_area_outputs,
 };
